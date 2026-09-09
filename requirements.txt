@@ -1,0 +1,16 @@
+# Windows Defensive Security Scanner - Dependencies
+# Note: The scanner core runs with pure standard Python libraries.
+# The following packages are optional and enhance process telemetry,
+# WMI querying, terminal aesthetics, and test execution.
+
+# Advanced process and service telemetry (recommended)
+psutil>=5.9.0
+
+# Windows Management Instrumentation (WMI) interface (Windows only)
+wmi>=1.5.1; sys_platform == 'win32'
+
+# Colored terminal output support on legacy Windows cmd.exe
+colorama>=0.4.6
+
+# Test framework for running unit and integration tests
+pytest>=7.4.0

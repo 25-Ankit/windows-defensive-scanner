@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & scan outputs
+*.log
+defensive_scan_log.txt
+remote_defensive_scan_log.txt
+fleet_log.txt
+usermode_incident_log.txt
