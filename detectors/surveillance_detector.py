@@ -12,6 +12,7 @@ import logging
 from typing import List, Dict, Any, Optional
 
 from .base_detector import BaseDetector
+from .allowlist import is_allowlisted_process, is_allowlisted_service, DEFAULT_BENIGN_PROCESSES, DEFAULT_BENIGN_SERVICES
 
 
 class SurveillanceDetector(BaseDetector):
@@ -31,27 +32,7 @@ class SurveillanceDetector(BaseDetector):
     ]
 
     # Known benign / legitimate Windows tools and common development applications to exclude
-    LEGITIMATE_ALLOWLIST = {
-        "mstsc.exe",            # Official Microsoft RDP client
-        "rdpclip.exe",          # Official Windows RDP clipboard utility
-        "vmware-vmx.exe",       # VMware Workstation
-        "vmtoolsd.exe",         # VMware Tools
-        "vboxservice.exe",      # VirtualBox Guest Additions
-        "vboxtray.exe",         # VirtualBox Tray
-        "dwm.exe",              # Desktop Window Manager
-        "perfmon.exe",          # Windows Performance Monitor
-        "resmon.exe",           # Windows Resource Monitor
-        "taskmgr.exe",          # Windows Task Manager
-        "wmiapsrv.exe",         # WMI Performance Adapter
-        "spoolsv.exe",          # Print Spooler
-        "explorer.exe",         # Windows Shell
-        # Common GUI/browser engines when evaluated in development
-        "code", "code.exe",
-        "chrome", "chrome.exe",
-        "brave", "brave.exe",
-        "firefox", "firefox.exe",
-        "chrome_crashpad_handler"
-    }
+    LEGITIMATE_ALLOWLIST = DEFAULT_BENIGN_PROCESSES
 
     # Scheduled task suspicious patterns (e.g. PowerShell screen capture)
     TASK_SCREEN_CAPTURE_PATTERNS = [
@@ -73,13 +54,22 @@ class SurveillanceDetector(BaseDetector):
         findings: List[Dict[str, Any]] = []
 
         self.logger.info("Scanning processes for surveillance indicators...")
-        findings.extend(self._scan_surveillance_processes())
+        try:
+            findings.extend(self._scan_surveillance_processes())
+        except Exception as e:
+            self.logger.warning("Error during surveillance process scan: %s", e)
 
         self.logger.info("Scanning services for surveillance keywords...")
-        findings.extend(self._scan_surveillance_services())
+        try:
+            findings.extend(self._scan_surveillance_services())
+        except Exception as e:
+            self.logger.warning("Error during surveillance services scan: %s", e)
 
         self.logger.info("Scanning scheduled tasks for automated screen capture routines...")
-        findings.extend(self._scan_screen_capture_tasks())
+        try:
+            findings.extend(self._scan_screen_capture_tasks())
+        except Exception as e:
+            self.logger.warning("Error during surveillance tasks scan: %s", e)
 
         return findings
 
@@ -92,15 +82,32 @@ class SurveillanceDetector(BaseDetector):
         processes = self.enumerate_processes()
 
         for proc in processes:
-            pid = proc.get("pid", 0)
-            name = (proc.get("name") or "").lower()
-            cmdline = (proc.get("cmdline") or "").lower()
+            if not isinstance(proc, dict):
+                continue
+
+            raw_pid = proc.get("pid", 0)
+            try:
+                pid = int(raw_pid) if raw_pid is not None else 0
+            except (ValueError, TypeError):
+                pid = 0
+
+            # Skip the scanning process itself
+            if pid == os.getpid():
+                continue
+
+            name = str(proc.get("name") or "").lower()
+            cmdline = str(proc.get("cmdline") or "").lower()
 
             # Skip Linux kernel threads if scanner is tested on POSIX
             if pid < 100 and not proc.get("exe") and not cmdline:
                 continue
 
-            if name in self.LEGITIMATE_ALLOWLIST:
+            exe_path = str(proc.get("exe") or "") if proc.get("exe") is not None else ""
+            if is_allowlisted_process(name, exe_path) or name in self.LEGITIMATE_ALLOWLIST:
+                continue
+
+            # Benign desktop volume monitors when scanner runs in POSIX desktop environment
+            if "volume-monitor" in name:
                 continue
 
             target_text = f"{name} {cmdline}"
@@ -116,7 +123,12 @@ class SurveillanceDetector(BaseDetector):
                     category="Covert Surveillance",
                     severity="WARN",
                     description=f"Process matches surveillance or remote capture indicators: {matched}",
-                    evidence=f"PID: {pid} | Process: {proc.get('name')} | Cmdline: {proc.get('cmdline')} | Indicators: {matched}"
+                    evidence=f"PID: {pid} | Process: {proc.get('name')} | Cmdline: {proc.get('cmdline')} | Indicators: {matched}",
+                    rule_id="RULE-SURV-PROCESS",
+                    process=proc.get("name"),
+                    pid=pid,
+                    path=proc.get("exe") or None,
+                    recommendation="Verify whether remote desktop / surveillance software is authorized under company policy; terminate if unauthorized."
                 ))
 
         return findings
@@ -132,15 +144,19 @@ class SurveillanceDetector(BaseDetector):
         # Legitimate Windows services related to remote access or display
         legitimate_services = {
             "termservice", "sessionenv", "umrdpservice", "dispbrokerdesktopsvc",
-            "lanmanserver", "lanmanworkstation", "remoteregistry"
+            "lanmanserver", "lanmanworkstation", "remoteregistry",
+            "rpcss", "rpclocator", "remoteaccess", "winrm", "rpcendpointmapper",
+            "dcomlaunch", "bthserv", "eventlog", "netman"
         }
 
         for svc in services:
-            svc_name = (svc.get("name") or "").lower()
-            display_name = (svc.get("display_name") or "").lower()
-            binpath = (svc.get("binpath") or "").lower()
+            if not isinstance(svc, dict):
+                continue
+            svc_name = str(svc.get("name") or "").lower()
+            display_name = str(svc.get("display_name") or "").lower()
+            binpath = str(svc.get("binpath") or "").lower()
 
-            if svc_name in legitimate_services:
+            if is_allowlisted_service(svc_name, binpath) or svc_name in legitimate_services:
                 continue
 
             text_to_check = f"{svc_name} {display_name} {binpath}"
@@ -155,7 +171,12 @@ class SurveillanceDetector(BaseDetector):
                     category="Covert Surveillance",
                     severity="WARN",
                     description=f"Service configured with surveillance or remote access keywords: {matched}",
-                    evidence=f"Service: {svc.get('name')} | Display: {svc.get('display_name')} | Path: {svc.get('binpath')}"
+                    evidence=f"Service: {svc.get('name')} | Display: {svc.get('display_name')} | Path: {svc.get('binpath')}",
+                    rule_id="RULE-SURV-SERVICE",
+                    process=svc.get("name"),
+                    pid=None,
+                    path=svc.get("binpath") or None,
+                    recommendation="Review service configuration and binary path; disable unauthorized remote access or surveillance service."
                 ))
 
         return findings
@@ -169,8 +190,10 @@ class SurveillanceDetector(BaseDetector):
         tasks = self.enumerate_scheduled_tasks()
 
         for task in tasks:
-            task_name = task.get("name", "")
-            action = (task.get("task_to_run") or "").lower()
+            if not isinstance(task, dict):
+                continue
+            task_name = str(task.get("name") or "")
+            action = str(task.get("task_to_run") or "").lower()
 
             matched_patterns = [p for p in self.TASK_SCREEN_CAPTURE_PATTERNS if p in action]
             if matched_patterns:
@@ -178,7 +201,12 @@ class SurveillanceDetector(BaseDetector):
                     category="Covert Surveillance",
                     severity="ALERT",
                     description=f"Scheduled task invokes automated screen capture or graphics grab routines: {matched_patterns}",
-                    evidence=f"Task Name: {task_name} | Action: {task.get('task_to_run')} | Matched: {matched_patterns}"
+                    evidence=f"Task Name: {task_name} | Action: {task.get('task_to_run')} | Matched: {matched_patterns}",
+                    rule_id="RULE-SURV-TASK",
+                    process=task_name,
+                    pid=None,
+                    path=task.get("task_to_run"),
+                    recommendation="Investigate scheduled task author and payload; delete tasks performing covert screen or audio capture."
                 ))
 
         return findings

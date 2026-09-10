@@ -96,12 +96,14 @@ class SecurityScanner:
         log_file: Optional[str] = None,
         color_enabled: bool = True,
         verbose: bool = False,
-        detectors_to_run: Optional[List[str]] = None
+        detectors_to_run: Optional[List[str]] = None,
+        json_mode: bool = False
     ):
         self.log_file = log_file or self.DEFAULT_LOG_FILE
         self.color = ColorPrinter(enabled=color_enabled)
         self.verbose = verbose
         self.detectors_to_run = detectors_to_run
+        self.json_mode = json_mode
 
         self.logger = self._setup_logging()
         self.detectors: List[BaseDetector] = self._initialize_detectors()
@@ -112,8 +114,9 @@ class SecurityScanner:
         logger.setLevel(logging.DEBUG if self.verbose else logging.INFO)
         logger.handlers.clear()
 
-        # Console Stream Handler
-        console_handler = logging.StreamHandler(sys.stdout)
+        # Route logs to stderr if in JSON mode to prevent stdout pollution
+        stream_target = sys.stderr if self.json_mode else sys.stdout
+        console_handler = logging.StreamHandler(stream_target)
         console_handler.setLevel(logging.DEBUG if self.verbose else logging.INFO)
         console_format = logging.Formatter(f"%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
         console_handler.setFormatter(console_format)
@@ -144,6 +147,8 @@ class SecurityScanner:
         return instances
 
     def print_banner(self) -> None:
+        if self.json_mode:
+            return
         banner = """
 ================================================================================
            WINDOWS DEFENSIVE SECURITY SCANNER - INCIDENT RESPONSE
@@ -172,17 +177,20 @@ class SecurityScanner:
         """
         Execute all registered detection modules sequentially.
         """
-        self.print_banner()
+        if not self.json_mode:
+            self.print_banner()
         self.findings.clear()
 
         start_time = datetime.now(timezone.utc)
 
         for detector in self.detectors:
             name = detector.__class__.__name__
-            print(f"\n{self.color.bold(f'[*] Running module: {name}')}")
+            if not self.json_mode:
+                print(f"\n{self.color.bold(f'[*] Running module: {name}')}")
             try:
                 module_findings = detector.run()
-                print(f"    Findings detected: {len(module_findings)}")
+                if not self.json_mode:
+                    print(f"    Findings detected: {len(module_findings)}")
                 self.findings.extend(module_findings)
             except Exception as e:
                 self.logger.error("Error executing detector %s: %s", name, e, exc_info=self.verbose)
@@ -190,7 +198,8 @@ class SecurityScanner:
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
 
         # Render console report
-        self.render_report(duration)
+        if not self.json_mode:
+            self.render_report(duration)
 
         # Write all findings to log file
         self.write_log_file()
@@ -199,32 +208,78 @@ class SecurityScanner:
 
     def render_report(self, duration: float) -> None:
         """
-        Print detailed findings and a categorized summary table to console.
+        Print detailed findings and clean summary output to console.
         """
+        host_name = platform.node() or "localhost"
+        scan_type = "Full" if not self.detectors_to_run else ", ".join(self.detectors_to_run)
+
+        counts = {
+            "CRITICAL": 0,
+            "ALERT": 0,   # HIGH
+            "WARN": 0,    # MEDIUM
+            "INFO": 0,    # LOW
+        }
+        for f in self.findings:
+            sev = f.get("severity", "INFO")
+            if sev in counts:
+                counts[sev] += 1
+            else:
+                counts["INFO"] += 1
+
         print("\n" + "=" * 80)
-        print(self.color.bold("                            SCAN FINDINGS DETAILS"))
+        print(self.color.bold("Windows Defensive Security Scanner"))
         print("=" * 80)
+        print(f"Host:      {host_name}")
+        print(f"Scan type: {scan_type}")
+        print(f"Duration:  {duration:.2f}s")
+        print("\nFindings")
+        print("--------")
+        print(f"CRITICAL: {counts['CRITICAL']}")
+        print(f"HIGH:     {counts['ALERT']}")
+        print(f"MEDIUM:   {counts['WARN']}")
+        print(f"LOW:      {counts['INFO']}")
 
         if not self.findings:
             print(self.color.green("\n[+] Scan completed. No suspicious indicators detected."))
         else:
+            print("\n" + "=" * 80)
+            print(self.color.bold("                            SCAN FINDINGS DETAILS"))
+            print("=" * 80)
+
             for idx, finding in enumerate(self.findings, 1):
                 sev = finding.get("severity", "INFO")
                 cat = finding.get("category", "General")
                 desc = finding.get("description", "")
                 evidence = finding.get("evidence", "")
                 ts = finding.get("timestamp", "")
+                f_id = finding.get("finding_id", "N/A")
+                rule_id = finding.get("rule_id", "N/A")
+                confidence = finding.get("confidence", "N/A")
+                risk_score = finding.get("risk_score", "N/A")
+                rec = finding.get("recommendation")
+                factors = finding.get("risk_factors")
 
-                if sev == "ALERT":
-                    sev_str = self.color.red(f"[{sev}]")
+                if sev == "CRITICAL":
+                    sev_str = self.color.red(f"[CRITICAL]")
+                elif sev == "ALERT":
+                    sev_str = self.color.red(f"[HIGH / {sev}]")
                 elif sev == "WARN":
-                    sev_str = self.color.yellow(f"[{sev}]")
+                    sev_str = self.color.yellow(f"[MEDIUM / {sev}]")
                 else:
-                    sev_str = self.color.cyan(f"[{sev}]")
+                    sev_str = self.color.cyan(f"[LOW / {sev}]")
 
                 print(f"\n{self.color.bold(f'[{idx}]')} {sev_str} {self.color.bold(cat)} ({ts})")
-                print(f"    Description: {desc}")
-                print(f"    Evidence:    {self.color.gray(evidence)}")
+                print(f"    Finding ID:     {f_id}")
+                print(f"    Rule ID:        {rule_id}")
+                print(f"    Severity:       {sev}")
+                print(f"    Confidence:     {confidence}")
+                print(f"    Risk score:     {risk_score}")
+                print(f"    Description:    {desc}")
+                print(f"    Evidence:       {self.color.gray(evidence)}")
+                if rec:
+                    print(f"    Recommendation: {rec}")
+                if factors:
+                    print(f"    Risk factors:   {', '.join(factors)}")
 
         # Print Summary Breakdown
         print("\n" + "=" * 80)
@@ -232,19 +287,16 @@ class SecurityScanner:
         print("=" * 80)
 
         counts_by_cat: Dict[str, int] = {}
-        counts_by_sev: Dict[str, int] = {"ALERT": 0, "WARN": 0, "INFO": 0}
-
         for f in self.findings:
             cat = f.get("category", "Unknown")
-            sev = f.get("severity", "INFO")
             counts_by_cat[cat] = counts_by_cat.get(cat, 0) + 1
-            counts_by_sev[sev] = counts_by_sev.get(sev, 0) + 1
 
         print(f"\nTotal Scan Duration: {duration:.2f} seconds")
         print(f"Total Findings:      {len(self.findings)}")
-        print(f"  - {self.color.red('ALERT (High Risk)')}:  {counts_by_sev['ALERT']}")
-        print(f"  - {self.color.yellow('WARN  (Suspicious)'):}  {counts_by_sev['WARN']}")
-        print(f"  - {self.color.cyan('INFO  (Low/Inform)'):}  {counts_by_sev['INFO']}")
+        print(f"  - {self.color.red('CRITICAL (Critical)')}: {counts['CRITICAL']}")
+        print(f"  - {self.color.red('HIGH / ALERT (High)'):}   {counts['ALERT']}")
+        print(f"  - {self.color.yellow('MEDIUM / WARN (Medium)'):} {counts['WARN']}")
+        print(f"  - {self.color.cyan('LOW / INFO (Low)')}:       {counts['INFO']}")
 
         print("\nCategory Breakdown:")
         for cat, count in sorted(counts_by_cat.items()):
@@ -261,6 +313,7 @@ class SecurityScanner:
                 f.write("=" * 80 + "\n")
                 f.write("WINDOWS DEFENSIVE SECURITY SCANNER - AUDIT LOG\n")
                 f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n")
+                f.write(f"Host:      {platform.node()}\n")
                 f.write(f"Platform:  {platform.system()} {platform.release()} ({platform.version()})\n")
                 f.write(f"Total Findings: {len(self.findings)}\n")
                 f.write("=" * 80 + "\n\n")
@@ -270,9 +323,18 @@ class SecurityScanner:
                 else:
                     for idx, finding in enumerate(self.findings, 1):
                         f.write(f"[{idx}] [{finding.get('severity')}] [{finding.get('category')}]\n")
-                        f.write(f"Timestamp:   {finding.get('timestamp')}\n")
-                        f.write(f"Description: {finding.get('description')}\n")
-                        f.write(f"Evidence:    {finding.get('evidence')}\n")
+                        f.write(f"Finding ID:     {finding.get('finding_id', 'N/A')}\n")
+                        f.write(f"Rule ID:        {finding.get('rule_id', 'N/A')}\n")
+                        f.write(f"Severity:       {finding.get('severity')}\n")
+                        f.write(f"Confidence:     {finding.get('confidence', 'N/A')}\n")
+                        f.write(f"Risk Score:     {finding.get('risk_score', 'N/A')}\n")
+                        f.write(f"Timestamp:      {finding.get('timestamp')}\n")
+                        f.write(f"Description:    {finding.get('description')}\n")
+                        f.write(f"Evidence:       {finding.get('evidence')}\n")
+                        if finding.get("recommendation"):
+                            f.write(f"Recommendation: {finding.get('recommendation')}\n")
+                        if finding.get("risk_factors"):
+                            f.write(f"Risk Factors:   {', '.join(finding.get('risk_factors'))}\n")
                         f.write("-" * 80 + "\n")
 
                 # Append Category Summary
@@ -286,7 +348,8 @@ class SecurityScanner:
                 for cat, cnt in sorted(counts_by_cat.items()):
                     f.write(f"{cat:<35}: {cnt}\n")
 
-            print(f"\n[+] Full findings log successfully saved to: {os.path.abspath(self.log_file)}")
+            if not self.json_mode:
+                print(f"\n[+] Full findings log successfully saved to: {os.path.abspath(self.log_file)}")
         except (OSError, PermissionError) as e:
             self.logger.error("Failed to write log file to %s: %s", self.log_file, e)
 
@@ -332,18 +395,19 @@ def main() -> int:
         log_file=args.log_file,
         color_enabled=not args.no_color,
         verbose=args.verbose,
-        detectors_to_run=args.modules
+        detectors_to_run=args.modules,
+        json_mode=args.json
     )
 
     findings = scanner.run()
 
     if args.json:
-        print("\n--- JSON OUTPUT ---")
+        print("--- JSON OUTPUT ---")
         print(json.dumps(findings, indent=2))
 
-    # Return exit code 2 if ALERT found, 1 if WARN found, 0 if clean
+    # Return exit code 2 if CRITICAL/ALERT found, 1 if WARN found, 0 if clean
     severities = {f.get("severity") for f in findings}
-    if "ALERT" in severities:
+    if "CRITICAL" in severities or "ALERT" in severities:
         return 2
     if "WARN" in severities:
         return 1

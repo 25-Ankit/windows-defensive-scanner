@@ -59,10 +59,16 @@ class CredentialTheftDetector(BaseDetector):
         findings: List[Dict[str, Any]] = []
 
         self.logger.info("Scanning process command lines for credential dumping tools...")
-        findings.extend(self._scan_process_cmdlines())
+        try:
+            findings.extend(self._scan_process_cmdlines())
+        except Exception as e:
+            self.logger.warning("Error during process command lines scan: %s", e)
 
         self.logger.info("Executing LSASS access and privilege heuristic...")
-        findings.extend(self._check_lsass_access_heuristic())
+        try:
+            findings.extend(self._check_lsass_access_heuristic())
+        except Exception as e:
+            self.logger.warning("Error during LSASS heuristic evaluation: %s", e)
 
         return findings
 
@@ -75,18 +81,42 @@ class CredentialTheftDetector(BaseDetector):
         processes = self.enumerate_processes()
 
         for proc in processes:
-            pid = proc.get("pid", 0)
-            name = (proc.get("name") or "").lower()
-            cmdline = (proc.get("cmdline") or "").lower()
+            if not isinstance(proc, dict):
+                continue
+
+            raw_pid = proc.get("pid", 0)
+            try:
+                pid = int(raw_pid) if raw_pid is not None else 0
+            except (ValueError, TypeError):
+                pid = 0
+
+            if pid == os.getpid():
+                continue
+
+            name = str(proc.get("name") or "").lower()
+            cmdline = str(proc.get("cmdline") or "").lower()
 
             # Check 1: Known tool name in process name or command line
-            matched_tools = [tool for tool in self.KNOWN_DUMP_TOOLS if tool in name or tool in cmdline]
+            matched_tools = []
+            for tool in self.KNOWN_DUMP_TOOLS:
+                if len(tool) <= 3:
+                    if re.search(r'(?<![a-zA-Z0-9])' + re.escape(tool) + r'(?![a-zA-Z0-9])', f"{name} {cmdline}"):
+                        matched_tools.append(tool)
+                else:
+                    if tool in name or tool in cmdline:
+                        matched_tools.append(tool)
+
             if matched_tools:
                 findings.append(self.create_finding(
                     category="Credential Theft",
                     severity="ALERT",
                     description=f"Known credential dumping tool identified: {matched_tools}",
-                    evidence=f"PID: {pid} | Process: {proc.get('name')} | Cmdline: {proc.get('cmdline')} | Tool: {matched_tools}"
+                    evidence=f"PID: {pid} | Process: {proc.get('name')} | Cmdline: {proc.get('cmdline')} | Tool: {matched_tools}",
+                    rule_id="RULE-CRED-TOOL",
+                    process=proc.get("name"),
+                    pid=pid,
+                    path=proc.get("exe") or None,
+                    recommendation="Isolate host immediately, investigate executing user account, and terminate dumping process."
                 ))
 
             # Check 2: LSASS combined with dump / read / inject / minidump
@@ -96,7 +126,12 @@ class CredentialTheftDetector(BaseDetector):
                         category="Credential Theft",
                         severity="ALERT",
                         description="Process command line targets LSASS with memory dumping or reading syntax",
-                        evidence=f"PID: {pid} | Process: {proc.get('name')} | Cmdline: {proc.get('cmdline')}"
+                        evidence=f"PID: {pid} | Process: {proc.get('name')} | Cmdline: {proc.get('cmdline')}",
+                        rule_id="RULE-CRED-LSASS-SYNTAX",
+                        process=proc.get("name"),
+                        pid=pid,
+                        path=proc.get("exe") or None,
+                        recommendation="Terminate process targeting LSASS memory, capture triage memory image, and audit security events."
                     ))
 
             # Check 3: Built-in LOLBAS comsvcs.dll minidump abuse:
@@ -106,7 +141,12 @@ class CredentialTheftDetector(BaseDetector):
                     category="Credential Theft",
                     severity="ALERT",
                     description="Native LOLBAS abuse detected: comsvcs.dll used to dump memory (likely LSASS)",
-                    evidence=f"PID: {pid} | Process: {proc.get('name')} | Cmdline: {proc.get('cmdline')}"
+                    evidence=f"PID: {pid} | Process: {proc.get('name')} | Cmdline: {proc.get('cmdline')}",
+                    rule_id="RULE-CRED-COMSVCS-LOLBAS",
+                    process=proc.get("name"),
+                    pid=pid,
+                    path=proc.get("exe") or None,
+                    recommendation="Investigate comsvcs minidump invocation, identify destination dump file, and terminate process."
                 ))
 
         return findings
@@ -176,7 +216,12 @@ class CredentialTheftDetector(BaseDetector):
                                 category="Credential Theft",
                                 severity="ALERT",
                                 description=f"Suspicious script host '{p_name}' attempting access to LSASS with debug privileges",
-                                evidence=f"PID: {p_pid} | Process: {p_name} | Cmdline: {proc.get('cmdline')}"
+                                evidence=f"PID: {p_pid} | Process: {p_name} | Cmdline: {proc.get('cmdline')}",
+                                rule_id="RULE-CRED-LSASS-ACCESS",
+                                process=p_name,
+                                pid=p_pid,
+                                path=proc.get("exe") or None,
+                                recommendation="Audit process permissions, revoke SeDebugPrivilege from non-administrative contexts, and terminate process."
                             ))
 
         except Exception as e:

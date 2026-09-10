@@ -13,6 +13,7 @@ import logging
 from typing import List, Dict, Any, Optional
 
 from .base_detector import BaseDetector
+from .allowlist import is_allowlisted_dll, DEFAULT_BENIGN_DLLS
 
 
 class KeyloggerDetector(BaseDetector):
@@ -36,10 +37,7 @@ class KeyloggerDetector(BaseDetector):
     ]
 
     # Whitelist legitimate system DLLs that might contain 'hook' in their name
-    KNOWN_BENIGN_DLLS = {
-        "userenv.dll",
-        "uxtheme.dll"
-    }
+    KNOWN_BENIGN_DLLS = DEFAULT_BENIGN_DLLS
 
     def __init__(self, logger: Optional[logging.Logger] = None):
         super().__init__(logger=logger)
@@ -51,13 +49,22 @@ class KeyloggerDetector(BaseDetector):
         findings: List[Dict[str, Any]] = []
 
         self.logger.info("Checking AppInit_DLLs registry entries...")
-        findings.extend(self._check_appinit_dlls())
+        try:
+            findings.extend(self._check_appinit_dlls())
+        except Exception as e:
+            self.logger.warning("Error during AppInit_DLLs check: %s", e)
 
         self.logger.info("Scanning process command lines for keyboard hook keywords...")
-        findings.extend(self._scan_process_hook_cmdlines())
+        try:
+            findings.extend(self._scan_process_hook_cmdlines())
+        except Exception as e:
+            self.logger.warning("Error during process hook cmdline check: %s", e)
 
         self.logger.info("Inspecting loaded modules for keyboard hook / keylogger libraries...")
-        findings.extend(self._scan_loaded_modules())
+        try:
+            findings.extend(self._scan_loaded_modules())
+        except Exception as e:
+            self.logger.warning("Error during loaded modules check: %s", e)
 
         return findings
 
@@ -74,10 +81,13 @@ class KeyloggerDetector(BaseDetector):
             load_appinit = 0
 
             for entry in entries:
-                name = entry.get("name", "")
-                data = entry.get("data", "")
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "")
+                data = entry.get("data")
                 if name.lower() == "appinit_dlls":
-                    appinit_dlls = str(data).strip()
+                    if data is not None:
+                        appinit_dlls = str(data).strip()
                 elif name.lower() == "loadappinit_dlls":
                     try:
                         load_appinit = int(data)
@@ -89,7 +99,12 @@ class KeyloggerDetector(BaseDetector):
                     category="Keylogging",
                     severity="ALERT",
                     description="AppInit_DLLs registry entry is non-empty (DLL injection / global hooking mechanism)",
-                    evidence=f"Registry Key: HKLM\\{subkey}\\AppInit_DLLs | Value: '{appinit_dlls}' | LoadAppInit_DLLs: {load_appinit}"
+                    evidence=f"Registry Key: HKLM\\{subkey}\\AppInit_DLLs | Value: '{appinit_dlls}' | LoadAppInit_DLLs: {load_appinit}",
+                    rule_id="RULE-KEYLOG-APPINIT",
+                    process=None,
+                    pid=None,
+                    path=f"HKLM\\{subkey}\\AppInit_DLLs",
+                    recommendation="Clear unauthorized DLL paths from AppInit_DLLs registry key and ensure Secure Boot is active."
                 ))
 
         return findings
@@ -103,9 +118,19 @@ class KeyloggerDetector(BaseDetector):
         processes = self.enumerate_processes()
 
         for proc in processes:
-            pid = proc.get("pid", 0)
-            name = proc.get("name", "")
-            cmdline = proc.get("cmdline", "")
+            if not isinstance(proc, dict):
+                continue
+            raw_pid = proc.get("pid", 0)
+            try:
+                pid = int(raw_pid) if raw_pid is not None else 0
+            except (ValueError, TypeError):
+                pid = 0
+
+            if pid == os.getpid():
+                continue
+
+            name = str(proc.get("name") or "")
+            cmdline = str(proc.get("cmdline") or "")
 
             if not cmdline:
                 continue
@@ -118,7 +143,12 @@ class KeyloggerDetector(BaseDetector):
                     category="Keylogging",
                     severity="ALERT",
                     description=f"Process command line references keyboard hook / keylogger functions: {matched}",
-                    evidence=f"PID: {pid} | Process: {name} | Cmdline: {cmdline} | Matched: {matched}"
+                    evidence=f"PID: {pid} | Process: {name} | Cmdline: {cmdline} | Matched: {matched}",
+                    rule_id="RULE-KEYLOG-CMDLINE",
+                    process=name,
+                    pid=pid,
+                    path=proc.get("exe") or None,
+                    recommendation="Terminate process invoking user-mode keyboard interception APIs and audit keystroke capture files."
                 ))
 
         return findings
@@ -132,13 +162,23 @@ class KeyloggerDetector(BaseDetector):
         processes = self.enumerate_processes()
 
         for proc in processes:
-            pid = proc.get("pid", 0)
-            name = proc.get("name", "")
+            if not isinstance(proc, dict):
+                continue
+            raw_pid = proc.get("pid", 0)
+            try:
+                pid = int(raw_pid) if raw_pid is not None else 0
+            except (ValueError, TypeError):
+                pid = 0
+            name = str(proc.get("name") or "")
             modules = self.enumerate_process_modules(pid)
+            if not isinstance(modules, list):
+                continue
 
             for mod_path in modules:
-                base_name = os.path.basename(mod_path).lower()
-                if base_name in self.KNOWN_BENIGN_DLLS:
+                if not mod_path:
+                    continue
+                base_name = self.get_path_basename(str(mod_path)).lower()
+                if is_allowlisted_dll(base_name) or base_name in self.KNOWN_BENIGN_DLLS:
                     continue
 
                 if "hook" in base_name or "keylog" in base_name:
@@ -146,7 +186,12 @@ class KeyloggerDetector(BaseDetector):
                         category="Keylogging",
                         severity="ALERT",
                         description=f"Suspicious hook/keylog module loaded in process: '{base_name}'",
-                        evidence=f"PID: {pid} | Process: {name} | Module Path: {mod_path}"
+                        evidence=f"PID: {pid} | Process: {name} | Module Path: {mod_path}",
+                        rule_id="RULE-KEYLOG-MODULE",
+                        process=name,
+                        pid=pid,
+                        path=mod_path,
+                        recommendation="Investigate third-party hook DLL loaded into process, inspect signing status, and quarantine binary."
                     ))
 
         return findings

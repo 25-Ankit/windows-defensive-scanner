@@ -8,6 +8,7 @@ digital signature verification, registry querying, service and scheduled task en
 
 import os
 import sys
+import re
 import math
 import shlex
 import logging
@@ -15,7 +16,14 @@ import platform
 import subprocess
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Union, Tuple
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+
+try:
+    from .finding import Finding
+    from .scoring import HeuristicScorer
+except ImportError:
+    from finding import Finding
+    from scoring import HeuristicScorer
 
 # Attempt to import optional Windows-specific and third-party libraries
 try:
@@ -82,27 +90,66 @@ class BaseDetector:
         category: str,
         severity: str,
         description: str,
-        evidence: Any
-    ) -> Dict[str, Any]:
+        evidence: Any,
+        rule_id: Optional[str] = None,
+        confidence: Optional[float] = None,
+        risk_score: Optional[int] = None,
+        recommendation: Optional[str] = None,
+        host: Optional[str] = None,
+        process: Optional[str] = None,
+        pid: Optional[Union[int, str]] = None,
+        path: Optional[str] = None,
+        finding_id: Optional[str] = None,
+        timestamp: Optional[str] = None,
+        signals: Optional[Dict[str, bool]] = None,
+        risk_factors: Optional[List[str]] = None,
+        **extra: Any
+    ) -> Finding:
         """
-        Generate a standardized finding object.
+        Generate a standardized Finding object conforming to the centralized schema.
         Severities:
-            - INFO: Informational observation or low-risk anomaly.
-            - WARN: Suspicious anomaly requiring analyst attention.
+            - CRITICAL: Immediate threat or active malicious weaponization.
             - ALERT: High-confidence threat or indicator of malicious activity.
+            - WARN: Suspicious anomaly requiring analyst attention.
+            - INFO: Informational observation or low-risk anomaly.
         """
-        severity_clean = severity.upper().strip()
-        if severity_clean not in ("INFO", "WARN", "ALERT"):
-            severity_clean = "WARN"
+        return Finding(
+            category=category,
+            severity=severity,
+            description=description,
+            evidence=evidence,
+            rule_id=rule_id,
+            confidence=confidence,
+            risk_score=risk_score,
+            recommendation=recommendation,
+            host=host,
+            process=process,
+            pid=pid,
+            path=path,
+            finding_id=finding_id,
+            timestamp=timestamp,
+            signals=signals,
+            risk_factors=risk_factors,
+            **extra
+        )
 
-        timestamp_str = datetime.now(timezone.utc).isoformat()
-        return {
-            "category": str(category),
-            "severity": severity_clean,
-            "description": str(description),
-            "evidence": str(evidence),
-            "timestamp": timestamp_str
-        }
+    def calculate_heuristic_score(
+        self,
+        severity: str,
+        category: Optional[str] = None,
+        rule_id: Optional[str] = None,
+        signals: Optional[Dict[str, bool]] = None,
+    ) -> Tuple[int, float, List[str]]:
+        """
+        Calculate an explainable heuristic risk score and confidence metric
+        using transparent, non-probabilistic technical signals.
+        """
+        return HeuristicScorer.calculate_score(
+            severity=severity,
+            category=category,
+            rule_id=rule_id,
+            signals=signals
+        )
 
     # -------------------------------------------------------------------------
     # Privilege & Environment Checks
@@ -180,7 +227,12 @@ class BaseDetector:
         """
         # If a custom signature checker is injected (useful for tests)
         if callable(self.signature_checker):
-            return self.signature_checker(file_path)
+            try:
+                res = self.signature_checker(file_path)
+                return res if isinstance(res, dict) else {"file_path": str(file_path), "is_signed": False, "valid": False, "status": "Error"}
+            except Exception as e:
+                self.logger.debug("Signature checker provider error: %s", e)
+                return {"file_path": str(file_path), "is_signed": False, "valid": False, "status": "Error"}
 
         clean_path = str(file_path).strip('"')
         result = {
@@ -246,7 +298,12 @@ class BaseDetector:
         Returns a list of dicts: {"name": str, "data": Any, "type": int, "root": str, "subkey": str}
         """
         if callable(self.registry_provider):
-            return self.registry_provider(root_key_name, subkey)
+            try:
+                res = self.registry_provider(root_key_name, subkey)
+                return res if isinstance(res, list) else []
+            except Exception as e:
+                self.logger.debug("Registry provider error for %s\\%s: %s", root_key_name, subkey, e)
+                return []
 
         if not winreg or platform.system() != "Windows":
             return []
@@ -317,7 +374,12 @@ class BaseDetector:
         }
         """
         if callable(self.process_provider):
-            return self.process_provider()
+            try:
+                res = self.process_provider()
+                return res if isinstance(res, list) else []
+            except Exception as e:
+                self.logger.debug("Process provider error: %s", e)
+                return []
 
         processes: List[Dict[str, Any]] = []
 
@@ -428,7 +490,12 @@ class BaseDetector:
         }
         """
         if callable(self.service_provider):
-            return self.service_provider()
+            try:
+                res = self.service_provider()
+                return res if isinstance(res, list) else []
+            except Exception as e:
+                self.logger.debug("Service provider error: %s", e)
+                return []
 
         services: List[Dict[str, Any]] = []
 
@@ -515,7 +582,12 @@ class BaseDetector:
         }
         """
         if callable(self.task_provider):
-            return self.task_provider()
+            try:
+                res = self.task_provider()
+                return res if isinstance(res, list) else []
+            except Exception as e:
+                self.logger.debug("Task provider error: %s", e)
+                return []
 
         tasks: List[Dict[str, Any]] = []
 
@@ -592,22 +664,54 @@ class BaseDetector:
     # Path & Environment Heuristics
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def get_path_basename(file_path: str) -> str:
+        """
+        Extract the file name from a path, correctly handling both Windows and POSIX separators.
+        """
+        if not file_path:
+            return ""
+        clean = str(file_path).strip('"\';, ')
+        return PureWindowsPath(clean).name
+
     def extract_file_path(self, command_str: str) -> Optional[str]:
         """
         Extract the primary executable file path from a command line string.
         Resolves environment variables like %SystemRoot%, %TEMP%, etc.
-        Handles quoted paths, flags, and arguments using Windows command semantics.
+        Handles quoted paths, flags, arguments, and unquoted paths with spaces.
         """
         if not command_str:
             return None
 
-        cmd_clean = os.path.expandvars(command_str.strip())
+        cmd_clean = os.path.expandvars(str(command_str).strip())
+        if not cmd_clean:
+            return None
 
-        # If wrapped in quotes, extract string inside quotes
+        # If wrapped in double quotes, extract string inside quotes
         if cmd_clean.startswith('"'):
             end_quote = cmd_clean.find('"', 1)
             if end_quote != -1:
                 return cmd_clean[1:end_quote].strip()
+            return cmd_clean.strip('"')
+
+        # If wrapped in single quotes, extract string inside quotes
+        if cmd_clean.startswith("'"):
+            end_quote = cmd_clean.find("'", 1)
+            if end_quote != -1:
+                return cmd_clean[1:end_quote].strip()
+            return cmd_clean.strip("'")
+
+        # Handle unquoted paths with spaces ending in executable extensions
+        ext_match = re.search(r'^(.*?\.(?:exe|bat|cmd|vbs|ps1|scr|dll|com|cpl|msi|sys))\b', cmd_clean, re.I)
+        if ext_match:
+            return ext_match.group(1).strip()
+
+        # Check if the command line starts with an option switch (e.g. " -", " /")
+        switch_match = re.search(r'^(.*?)(?:\s+[-/][a-zA-Z?])', cmd_clean)
+        if switch_match:
+            candidate = switch_match.group(1).strip()
+            if candidate:
+                return candidate
 
         # Use posix=False so backslashes '\' are treated as path separators, not escape characters
         try:
@@ -621,6 +725,24 @@ class BaseDetector:
         candidate = cmd_clean.split()[0]
         return candidate.strip('"\';,')
 
+    def check_unquoted_path_vulnerability(self, command_str: str) -> bool:
+        """
+        Check if a command line exhibits CWE-428 (Unquoted Search Path or Element):
+        Path contains spaces, is not enclosed in quotation marks, and contains arguments or path separators.
+        """
+        if not command_str:
+            return False
+        cmd_clean = str(command_str).strip()
+        if cmd_clean.startswith('"') or cmd_clean.startswith("'"):
+            return False
+        extracted = self.extract_file_path(cmd_clean)
+        if not extracted:
+            return False
+        # If the extracted path has spaces and is not enclosed in quotes
+        if " " in extracted and ("\\" in extracted or "/" in extracted):
+            return True
+        return False
+
     def is_temp_or_user_writable(self, path: str) -> bool:
         """
         Determine whether a given file/folder path points to a temporary,
@@ -629,7 +751,7 @@ class BaseDetector:
         if not path:
             return False
 
-        norm = os.path.normpath(str(path)).lower()
+        norm = os.path.normpath(str(path)).lower().replace("/", "\\")
 
         suspicious_keywords = [
             "\\temp\\",
@@ -647,9 +769,9 @@ class BaseDetector:
         ]
 
         # Expand current env vars to catch actual paths
-        expanded_temp = os.path.normpath(os.path.expandvars("%TEMP%")).lower()
-        expanded_appdata = os.path.normpath(os.path.expandvars("%APPDATA%")).lower()
-        expanded_localappdata = os.path.normpath(os.path.expandvars("%LOCALAPPDATA%")).lower()
+        expanded_temp = os.path.normpath(os.path.expandvars("%TEMP%")).lower().replace("/", "\\")
+        expanded_appdata = os.path.normpath(os.path.expandvars("%APPDATA%")).lower().replace("/", "\\")
+        expanded_localappdata = os.path.normpath(os.path.expandvars("%LOCALAPPDATA%")).lower().replace("/", "\\")
 
         # Check explicit paths
         for kw in suspicious_keywords:
@@ -663,8 +785,8 @@ class BaseDetector:
         if expanded_localappdata and expanded_localappdata in norm:
             return True
 
-        # Check if path is under C:\Users\ (excluding legitimate default program directories)
-        if norm.startswith("c:\\users\\") and "\\appdata\\" in norm:
+        # Check if path is under C:\Users\ (or any user profile directory)
+        if norm.startswith("c:\\users\\") or "\\users\\" in norm:
             return True
 
         return False
@@ -676,11 +798,20 @@ class BaseDetector:
         if not path:
             return False
 
-        norm = os.path.normpath(str(path)).lower()
+        norm = os.path.normpath(str(path)).lower().replace("/", "\\")
+
+        # Never treat temp, appdata, or user directories as standard system paths
+        if self.is_temp_or_user_writable(norm):
+            return False
+
         system_prefixes = [
             "c:\\windows",
             "c:\\program files",
             "c:\\program files (x86)"
         ]
+
+        # Also support alternate drive letters (e.g. D:\Windows, E:\Program Files)
+        if re.match(r"^[a-z]:\\(windows|program files|program files \(x86\))\b", norm, re.I):
+            return True
 
         return any(norm.startswith(prefix) for prefix in system_prefixes)

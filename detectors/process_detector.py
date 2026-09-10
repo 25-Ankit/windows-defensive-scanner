@@ -14,6 +14,7 @@ import logging
 from typing import List, Dict, Any, Optional
 
 from .base_detector import BaseDetector
+from .allowlist import is_allowlisted_process, is_user_writable_path
 
 
 class ProcessDetector(BaseDetector):
@@ -36,26 +37,33 @@ class ProcessDetector(BaseDetector):
         "explorer.exe": ["c:\\windows\\explorer.exe", "c:\\windows\\syswow64\\explorer.exe"],
     }
 
-    # Suspicious keyword regex patterns with word boundary constraints to avoid substring false positives
-    SUSPICIOUS_KEYWORD_PATTERNS = [
+    # High-confidence attack tool and C2 framework keyword patterns
+    HIGH_CONFIDENCE_MALWARE_PATTERNS = [
+        re.compile(r"(?<![a-zA-Z0-9])mimikatz", re.I),
+        re.compile(r"(?<![a-zA-Z0-9])meterpreter", re.I),
+        re.compile(r"(?<![a-zA-Z0-9])cobaltstrike", re.I),
+        re.compile(r"(?<![a-zA-Z0-9])powersploit", re.I),
+        re.compile(r"(?<![a-zA-Z0-9])empire(?![a-zA-Z0-9])", re.I),
+        re.compile(r"(?<![a-zA-Z0-9])reverse_tcp", re.I),
+        re.compile(r"(?<![a-zA-Z0-9])backdoor", re.I),
+        re.compile(r"(?<![a-zA-Z0-9])beacon", re.I),
+        re.compile(r"(?<![a-zA-Z0-9])stealer", re.I),
+    ]
+
+    # Contextual / ambiguous suspicious patterns (require corroboration or non-standard context)
+    CONTEXTUAL_SUSPICIOUS_PATTERNS = [
         re.compile(r"(?<![a-zA-Z0-9])keylog", re.I),
         re.compile(r"(?<![a-zA-Z0-9])hook(?![a-zA-Z0-9])", re.I),
         re.compile(r"(?<![a-zA-Z0-9])spy(?![a-zA-Z0-9])", re.I),
         re.compile(r"(?<![a-zA-Z0-9])rat(?![a-zA-Z0-9])", re.I),
-        re.compile(r"(?<![a-zA-Z0-9])stealer", re.I),
         re.compile(r"(?<![a-zA-Z0-9])logger(?![a-zA-Z0-9])", re.I),
         re.compile(r"(?<![a-zA-Z0-9])inject(?![a-zA-Z0-9])", re.I),
         re.compile(r"(?<![a-zA-Z0-9])hidden(?![a-zA-Z0-9])", re.I),
-        re.compile(r"(?<![a-zA-Z0-9])backdoor", re.I),
-        re.compile(r"(?<![a-zA-Z0-9])meterpreter", re.I),
-        re.compile(r"(?<![a-zA-Z0-9])beacon", re.I),
-        re.compile(r"(?<![a-zA-Z0-9])reverse_tcp", re.I),
         re.compile(r"(?<![a-zA-Z0-9])c2(?![a-zA-Z0-9])", re.I),
-        re.compile(r"(?<![a-zA-Z0-9])cobaltstrike", re.I),
-        re.compile(r"(?<![a-zA-Z0-9])powersploit", re.I),
-        re.compile(r"(?<![a-zA-Z0-9])empire(?![a-zA-Z0-9])", re.I),
-        re.compile(r"(?<![a-zA-Z0-9])mimikatz", re.I)
     ]
+
+    # Consolidated list for full scan compatibility
+    SUSPICIOUS_KEYWORD_PATTERNS = HIGH_CONFIDENCE_MALWARE_PATTERNS + CONTEXTUAL_SUSPICIOUS_PATTERNS
 
     ENTROPY_PACKED_THRESHOLD = 7.5
 
@@ -85,14 +93,17 @@ class ProcessDetector(BaseDetector):
         Check if a process name is deceptively similar (typosquatting or visual spoofing)
         to a protected Windows core system process.
         """
-        base_name = proc_name.lower()
+        if not proc_name or not str(proc_name).strip():
+            return None
+        proc_str = str(proc_name)
+        base_name = proc_str.lower()
         if base_name.endswith(".exe"):
             base_clean = base_name[:-4]
         else:
             base_clean = base_name
 
         # Check for trailing whitespace or dot abuse (e.g. "svchost.exe ")
-        if proc_name.rstrip(". ") != proc_name:
+        if proc_str.rstrip(". ") != proc_str:
             return "Process name contains trailing whitespace or dot characters"
 
         # Check homoglyph / leetspeak substitutions (0->o, 1->l, 5->s, 3->e)
@@ -128,11 +139,25 @@ class ProcessDetector(BaseDetector):
         scanned_exes = set()
 
         for proc in processes:
-            pid = proc.get("pid", 0)
-            name = (proc.get("name") or "").lower()
-            raw_name = proc.get("name") or ""
-            exe_path = proc.get("exe") or ""
-            cmdline = proc.get("cmdline") or ""
+            if not isinstance(proc, dict):
+                continue
+
+            raw_pid = proc.get("pid", 0)
+            try:
+                pid = int(raw_pid) if raw_pid is not None else 0
+            except (ValueError, TypeError):
+                pid = 0
+
+            # Skip the scanning process itself
+            if pid == os.getpid():
+                continue
+
+            raw_input_name = str(proc.get("name") or "")
+            # Extract image filename while preserving trailing whitespace or dot characters
+            raw_name = raw_input_name.replace("/", "\\").split("\\")[-1] if raw_input_name else ""
+            name = raw_name.strip().lower()
+            exe_path = str(proc.get("exe") or "") if proc.get("exe") is not None else ""
+            cmdline = str(proc.get("cmdline") or "") if proc.get("cmdline") is not None else ""
 
             # Skip Linux kernel threads if scanner is tested on POSIX
             if pid < 100 and not exe_path and not cmdline:
@@ -148,20 +173,30 @@ class ProcessDetector(BaseDetector):
                     category="Process Spoofing / AV Evasion",
                     severity="ALERT",
                     description=f"Suspicious lookalike process name detected ({typo_reason})",
-                    evidence=f"PID: {pid} | Process Name: '{raw_name}' | Path: '{exe_path}' | Reason: {typo_reason}"
+                    evidence=f"PID: {pid} | Process Name: '{raw_name}' | Path: '{exe_path}' | Reason: {typo_reason}",
+                    rule_id="RULE-PROC-TYPOSQUAT",
+                    process=raw_name,
+                    pid=pid,
+                    path=exe_path or None,
+                    recommendation="Inspect process origin, parent process lineage, and verify authenticity against genuine Windows binaries."
                 ))
 
             # Check 1B: Exact System Process Canonical Path Verification
             if name in self.SYSTEM_PROCESS_PATHS:
                 expected_paths = self.SYSTEM_PROCESS_PATHS[name]
                 if exe_path:
-                    norm_exe = os.path.normpath(os.path.expandvars(exe_path)).lower()
+                    norm_exe = os.path.normpath(os.path.expandvars(exe_path.strip('"\''))).lower().replace("/", "\\")
                     if norm_exe not in expected_paths:
                         findings.append(self.create_finding(
                             category="Process Spoofing / AV Evasion",
                             severity="ALERT",
                             description=f"System process '{name}' running from unauthorized location (Process Masquerading)",
-                            evidence=f"PID: {pid} | Process: {name} | Path: {exe_path} | Expected: {', '.join(expected_paths)}"
+                            evidence=f"PID: {pid} | Process: {name} | Path: {exe_path} | Expected: {', '.join(expected_paths)}",
+                            rule_id="RULE-PROC-MASQUERADE",
+                            process=name,
+                            pid=pid,
+                            path=exe_path or None,
+                            recommendation="Terminate the masquerading process, capture memory/disk artifacts, and investigate parent process."
                         ))
                 elif not exe_path and platform_is_windows():
                     # Process exists with system name but path is inaccessible
@@ -169,26 +204,52 @@ class ProcessDetector(BaseDetector):
                         category="Process Spoofing / AV Evasion",
                         severity="WARN",
                         description=f"System process '{name}' detected with inaccessible or hidden executable path",
-                        evidence=f"PID: {pid} | Process: {name} | Cmdline: {cmdline}"
+                        evidence=f"PID: {pid} | Process: {name} | Cmdline: {cmdline}",
+                        rule_id="RULE-PROC-INACCESSIBLE",
+                        process=name,
+                        pid=pid,
+                        path=None,
+                        recommendation="Run scanner with elevated administrative rights and inspect process handles with Process Explorer."
                     ))
 
             # -----------------------------------------------------------------
             # 2. Suspicious Process Names & Command Lines
             # -----------------------------------------------------------------
             target_str = f"{name} {cmdline}"
-            matched_keywords = []
-            for pat in self.SUSPICIOUS_KEYWORD_PATTERNS:
-                m = pat.search(target_str)
-                if m:
-                    matched_keywords.append(m.group(0))
+            high_matched = [p.search(target_str).group(0) for p in self.HIGH_CONFIDENCE_MALWARE_PATTERNS if p.search(target_str)]
+            context_matched = [p.search(target_str).group(0) for p in self.CONTEXTUAL_SUSPICIOUS_PATTERNS if p.search(target_str)]
+            matched_keywords = high_matched + context_matched
 
             if matched_keywords:
-                findings.append(self.create_finding(
-                    category="Process Spoofing / AV Evasion",
-                    severity="ALERT",
-                    description=f"Process name or command line matches suspicious malware indicators: {matched_keywords}",
-                    evidence=f"PID: {pid} | Name: {name} | Cmdline: {cmdline} | Matched: {matched_keywords}"
-                ))
+                in_user_path = self.is_temp_or_user_writable(exe_path) or self.is_temp_or_user_writable(cmdline)
+                is_allowlisted = is_allowlisted_process(name, exe_path)
+
+                # Contextual False Positive Filter:
+                # If process is recognized legitimate software executing from standard path,
+                # and only a single weak/ambiguous keyword matched without high-confidence indicators,
+                # do not flag as an alert.
+                if is_allowlisted and not high_matched and not in_user_path and len(matched_keywords) <= 1:
+                    pass
+                else:
+                    # Require multiple indicators, attack tools, or user-writable path for ALERT; else WARN
+                    sev = "ALERT" if (high_matched or in_user_path or len(matched_keywords) >= 2) else "WARN"
+                    findings.append(self.create_finding(
+                        category="Process Spoofing / AV Evasion",
+                        severity=sev,
+                        description=f"Process name or command line matches suspicious malware indicators: {matched_keywords}",
+                        evidence=f"PID: {pid} | Name: {name} | Cmdline: {cmdline} | Matched: {matched_keywords}",
+                        rule_id="RULE-PROC-KEYWORD",
+                        process=name,
+                        pid=pid,
+                        path=exe_path or None,
+                        recommendation="Inspect process command line arguments, parent process tree, and network connections.",
+                        signals={
+                            "known_attack_tool": bool(high_matched),
+                            "suspicious_cmdline": True,
+                            "user_writable_path": in_user_path,
+                            "multiple_indicators": len(matched_keywords) >= 2 or (bool(matched_keywords) and in_user_path)
+                        }
+                    ))
 
             # -----------------------------------------------------------------
             # 3. Executable File Analysis (Signatures and Entropy)
@@ -209,7 +270,12 @@ class ProcessDetector(BaseDetector):
                                 category="Process Spoofing / AV Evasion",
                                 severity="ALERT",
                                 description=f"Unsigned or untrusted binary running from Windows system directory",
-                                evidence=f"PID: {pid} | File: {expanded_exe} | Signature Status: {status}"
+                                evidence=f"PID: {pid} | File: {expanded_exe} | Signature Status: {status}",
+                                rule_id="RULE-PROC-UNSIGNED",
+                                process=name,
+                                pid=pid,
+                                path=expanded_exe,
+                                recommendation="Verify executable authenticity via Sigcheck; isolate and inspect dropped binary."
                             ))
 
                     # Shannon Entropy Calculation (First 4KB)
@@ -219,7 +285,12 @@ class ProcessDetector(BaseDetector):
                             category="Process Spoofing / AV Evasion",
                             severity="ALERT",
                             description=f"Process executable exhibits high entropy ({entropy:.4f} > {self.ENTROPY_PACKED_THRESHOLD}), indicating packing, compression, or encryption (AV Evasion)",
-                            evidence=f"PID: {pid} | File: {expanded_exe} | Entropy: {entropy:.4f}"
+                            evidence=f"PID: {pid} | File: {expanded_exe} | Entropy: {entropy:.4f}",
+                            rule_id="RULE-PROC-PACKED",
+                            process=name,
+                            pid=pid,
+                            path=expanded_exe,
+                            recommendation="Analyze binary for known packers (UPX, Themida) and extract memory strings for analysis."
                         ))
 
         return findings

@@ -6,12 +6,33 @@ Orchestrates defensive security scans across remote Windows endpoints via
 WinRM / PowerShell Remoting. Transfers the scanner payload, executes it remotely
 with administrative privileges, retrieves structured JSON findings, cleans up artifacts,
 and generates a consolidated multi-host incident response report.
+
+Authentication & Security Model:
+- Supported Authentication Mechanisms:
+  1. Passwordless Integrated Windows Authentication / Kerberos SSO (preferred for domain environments).
+  2. Elevated domain/local credentials passed via PSCredential over encrypted WinRM.
+  3. Credential injection via private subprocess environment variable (DEFSCAN_TARGET_PASS)
+     fed into PowerShell via stdin (-Command -), avoiding process table (ps/Get-Process) exposure.
+  4. Environment variable (DEFSCAN_PASSWORD) and interactive TTY prompt (getpass) supported.
+- Security Guarantees:
+  - Zero plaintext credentials stored in source files, logs, or staged artifacts.
+  - Automatic recursive redaction of credentials in errors, JSON findings, and reports.
+  - Target hostnames and usernames strictly validated against injection patterns.
+  - Temporary staging directories wiped in a guaranteed finally block on target hosts.
+- Documented Limitations:
+  - WinRM requires TCP port 5985 (HTTP with Kerberos/SPNEGO encryption) or 5986 (HTTPS).
+  - Unencrypted WinRM over untrusted networks without Kerberos/Negotiate is insecure and not recommended.
+  - Target endpoints must have PowerShell Remoting enabled (Enable-PSRemoting).
+  - Orchestrator requires local powershell.exe or pwsh executable available in PATH.
 """
 
 import os
 import sys
+import re
 import json
 import base64
+import shutil
+import getpass
 import argparse
 import logging
 import platform
@@ -20,6 +41,29 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Allowed patterns for target identifiers (hostname, IPv4, IPv6, FQDN, with optional port)
+TARGET_PATTERN = re.compile(r"^[a-zA-Z0-9_\.\-:]+$")
+
+# Allowed characters for Windows domain\username or user@domain
+USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9_\.\-\\ '@]+$")
+
+
+def get_powershell_executable() -> str:
+    """
+    Auto-detect available PowerShell binary across Windows, Linux, and macOS.
+    On Windows: powershell.exe or pwsh.exe
+    On Linux/macOS: pwsh or powershell
+    """
+    candidates = (
+        ["powershell.exe", "powershell", "pwsh.exe", "pwsh"]
+        if platform.system() == "Windows"
+        else ["pwsh", "powershell", "powershell.exe"]
+    )
+    for cand in candidates:
+        if shutil.which(cand):
+            return cand
+    return "powershell.exe" if platform.system() == "Windows" else "pwsh"
 
 
 class RemoteScannerOrchestrator:
@@ -55,6 +99,22 @@ class RemoteScannerOrchestrator:
         logger.addHandler(handler)
         return logger
 
+    @staticmethod
+    def _redact_credentials(data: Any, secret: str) -> Any:
+        """
+        Recursively redact cleartext password occurrences from nested findings,
+        dictionaries, lists, or strings.
+        """
+        if not secret:
+            return data
+        if isinstance(data, str):
+            return data.replace(secret, "[REDACTED]")
+        elif isinstance(data, dict):
+            return {k: RemoteScannerOrchestrator._redact_credentials(v, secret) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [RemoteScannerOrchestrator._redact_credentials(item, secret) for item in data]
+        return data
+
     def build_remote_payload_bundle(self) -> str:
         """
         Bundle scanner.py and the detectors/ package into a base64-encoded zip archive
@@ -86,9 +146,10 @@ class RemoteScannerOrchestrator:
         """
         Execute scan on a single remote endpoint and return findings and status.
         """
-        self.logger.info("Initiating remote scan on target: %s", target)
+        clean_target = target.strip()
+        self.logger.info("Initiating remote scan on target: %s", clean_target)
         result: Dict[str, Any] = {
-            "target": target,
+            "target": clean_target,
             "status": "FAILED",
             "findings": [],
             "error": None,
@@ -97,7 +158,21 @@ class RemoteScannerOrchestrator:
 
         # If custom command runner is injected (for unit tests)
         if callable(self.command_runner):
-            return self.command_runner(target)
+            return self.command_runner(clean_target)
+
+        # Validate target hostname / IP
+        if not clean_target or not TARGET_PATTERN.match(clean_target):
+            self.logger.error("Target identifier '%s' failed validation.", clean_target)
+            result["status"] = "ERROR"
+            result["error"] = f"Invalid target identifier: '{clean_target}'. Hostnames and IPs must only contain alphanumeric characters, dots, hyphens, colons, or underscores."
+            return result
+
+        # Validate username if supplied
+        if self.username and not USERNAME_PATTERN.match(self.username):
+            self.logger.error("Username '%s' contains disallowed characters.", self.username)
+            result["status"] = "ERROR"
+            result["error"] = f"Invalid username format: '{self.username}' contains disallowed characters."
+            return result
 
         bundle_b64 = self.build_remote_payload_bundle()
         module_args = (" -m " + " ".join(self.modules)) if self.modules else ""
@@ -135,17 +210,40 @@ try {{
 """
 
         try:
-            # Build Invoke-Command via powershell
-            cmd = ["powershell.exe", "-NoProfile", "-NonInteractive"]
+            ps_exe = get_powershell_executable()
+            escaped_target = target.replace("'", "''")
+            sub_env = os.environ.copy()
+
+            # Build Invoke-Command via powershell with escaped credentials
+            # Credentials are passed via private subprocess environment variable and cleared immediately
             if self.username and self.password:
-                cred_block = f"$secPass = ConvertTo-SecureString '{self.password}' -AsPlainText -Force; $cred = New-Object System.Management.Automation.PSCredential ('{self.username}', $secPass);"
-                invoke_block = f"{cred_block} Invoke-Command -ComputerName '{target}' -Credential $cred -ScriptBlock {{ {ps_remote_script} }}"
+                sub_env["DEFSCAN_TARGET_PASS"] = self.password
+                escaped_user = self.username.replace("'", "''")
+                cred_block = (
+                    f"$passEnv = $env:DEFSCAN_TARGET_PASS; "
+                    f"$env:DEFSCAN_TARGET_PASS = $null; "
+                    f"$secPass = ConvertTo-SecureString $passEnv -AsPlainText -Force; "
+                    f"$cred = New-Object System.Management.Automation.PSCredential ('{escaped_user}', $secPass);"
+                )
+                invoke_block = f"{cred_block} Invoke-Command -ComputerName '{escaped_target}' -Credential $cred -ScriptBlock {{ {ps_remote_script} }}"
             else:
-                invoke_block = f"Invoke-Command -ComputerName '{target}' -ScriptBlock {{ {ps_remote_script} }}"
+                invoke_block = f"Invoke-Command -ComputerName '{escaped_target}' -ScriptBlock {{ {ps_remote_script} }}"
 
-            cmd.extend(["-Command", invoke_block])
+            # Pass script via stdin with -Command - to avoid Windows 32,767 char command line limit
+            cmd = [ps_exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"]
 
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+            proc = subprocess.run(
+                cmd,
+                input=invoke_block,
+                env=sub_env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False
+            )
+
+            # Scrub password from memory in parent process
+            sub_env.pop("DEFSCAN_TARGET_PASS", None)
 
             if proc.returncode == 0:
                 raw_out = proc.stdout.strip()
@@ -163,17 +261,27 @@ try {{
                         result["findings"] = []
                 except json.JSONDecodeError as jde:
                     result["status"] = "ERROR"
-                    result["error"] = f"Failed to parse remote JSON output: {jde} | Raw: {raw_out[:300]}"
+                    raw_sanitized = raw_out[:300]
+                    if self.password:
+                        raw_sanitized = raw_sanitized.replace(self.password, "[REDACTED]")
+                    result["error"] = f"Failed to parse remote JSON output: {jde} | Raw: {raw_sanitized}"
             else:
+                err_text = proc.stderr.strip() or f"Process exited with code {proc.returncode}"
+                if self.password:
+                    err_text = err_text.replace(self.password, "[REDACTED]")
                 result["status"] = "ERROR"
-                result["error"] = proc.stderr.strip() or f"Process exited with code {proc.returncode}"
+                result["error"] = err_text
 
         except subprocess.TimeoutExpired:
             result["status"] = "TIMEOUT"
             result["error"] = "Remote scan timed out after 120 seconds"
         except Exception as e:
+            err_msg = str(e)
             result["status"] = "ERROR"
-            result["error"] = str(e)
+            result["error"] = err_msg
+
+        if self.password:
+            result = self._redact_credentials(result, self.password)
 
         return result
 
@@ -259,7 +367,7 @@ def main() -> int:
     parser.add_argument("targets", nargs="*", help="Remote hostnames or IP addresses to scan")
     parser.add_argument("--targets-file", "-f", help="File containing target hostnames/IPs (one per line)")
     parser.add_argument("--username", "-u", help="Remote Windows administrative username")
-    parser.add_argument("--password", "-p", help="Remote Windows administrative password")
+    parser.add_argument("--password", "-p", help="Remote Windows administrative password (prefer DEFSCAN_PASSWORD env var or interactive prompt)")
     parser.add_argument("--output", "-o", default="remote_defensive_scan_log.txt", help="Consolidated output log file")
     parser.add_argument("--module", "-m", nargs="+", help="Specific detector module(s) to execute on targets")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
@@ -279,10 +387,27 @@ def main() -> int:
         print("\n[!] Error: At least one remote target must be provided via arguments or --targets-file.")
         return 1
 
+    # Resolve password securely: CLI flag -> DEFSCAN_PASSWORD env var -> interactive prompt
+    password = args.password
+    if args.password:
+        logging.getLogger("RemoteScannerOrchestrator").warning(
+            "SECURITY WARNING: Passing passwords via CLI arguments (-p/--password) exposes credentials in process listings and shell history. Prefer DEFSCAN_PASSWORD environment variable or interactive prompt."
+        )
+    if not password:
+        password = os.environ.get("DEFSCAN_PASSWORD")
+
+    if not password and args.username:
+        if sys.stdin.isatty():
+            try:
+                password = getpass.getpass(f"Enter password for remote user '{args.username}': ")
+            except (EOFError, KeyboardInterrupt):
+                print("\n[!] Scan aborted by user.")
+                return 1
+
     orchestrator = RemoteScannerOrchestrator(
         targets=target_list,
         username=args.username,
-        password=args.password,
+        password=password,
         output_file=args.output,
         modules=args.module,
         verbose=args.verbose
