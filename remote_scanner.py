@@ -3,7 +3,7 @@
 Remote Windows Defensive Security Scanner Orchestrator.
 
 Orchestrates defensive security scans across remote Windows endpoints via
-WinRM / PowerShell Remoting. Transfers the scanner payload, executes it remotely
+WinRM / PowerShell Remoting. Transfers scanner payload, executes it remotely
 with administrative privileges, retrieves structured JSON findings, cleans up artifacts,
 and generates a consolidated multi-host incident response report.
 
